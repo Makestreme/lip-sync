@@ -1,4 +1,5 @@
 import { phonemize } from "https://esm.sh/phonemizer@1.2.1";
+import * as Mp4Muxer from "https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.4/+esm";
 
 const ORT_URL = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js";
 const MODEL_URL = "voices/en_US-ryan-medium.onnx";
@@ -274,27 +275,138 @@ function drawFrame(ctx, mode, shape) {
   }
 }
 
-function getMimeType() {
-  const types = [
-    "video/mp4;codecs=avc1",
-    "video/mp4",
-    "video/webm;codecs=h264",
-    "video/webm;codecs=vp9",
-    "video/webm"
-  ];
-  for (const t of types) {
-    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) {
-      return t;
-    }
-  }
-  return "";
-}
-
 async function exportVideo(mode) {
   if (!audioBlob || !events.length) return;
 
+  if (typeof VideoEncoder !== "undefined" && typeof AudioEncoder !== "undefined") {
+    return exportVideoMp4(mode);
+  } else {
+    return exportVideoMediaRecorder(mode);
+  }
+}
+
+async function exportVideoMp4(mode) {
   generateBtn.disabled = playBtn.disabled = downloadFaceBtn.disabled = downloadMouthBtn.disabled = true;
-  setStatus(`Exporting ${mode === "face" ? "face" : "greenscreen mouth"} MP4...`, "loading");
+  setStatus(`Encoding ${mode === "face" ? "face" : "greenscreen mouth"} MP4...`, "loading");
+
+  try {
+    const arrayBuf = await audioBlob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+    const sampleRate = audioBuffer.sampleRate;
+    const duration = audioBuffer.duration;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 1080;
+    canvas.height = 1080;
+    const ctx = canvas.getContext("2d");
+
+    const muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: {
+        codec: "avc",
+        width: 1080,
+        height: 1080
+      },
+      audio: {
+        codec: "aac",
+        numberOfChannels: 1,
+        sampleRate: sampleRate
+      },
+      fastStart: "in-memory"
+    });
+
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => console.error("VideoEncoder error:", e)
+    });
+
+    videoEncoder.configure({
+      codec: "avc1.42E01E",
+      width: 1080,
+      height: 1080,
+      bitrate: 4_000_000,
+      framerate: 60
+    });
+
+    const audioEncoder = new AudioEncoder({
+      output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+      error: (e) => console.error("AudioEncoder error:", e)
+    });
+
+    audioEncoder.configure({
+      codec: "mp4a.40.2",
+      numberOfChannels: 1,
+      sampleRate: sampleRate,
+      bitrate: 128_000
+    });
+
+    const pcmData = audioBuffer.getChannelData(0);
+    const audioData = new AudioData({
+      format: "f32-planar",
+      sampleRate: sampleRate,
+      numberOfFrames: pcmData.length,
+      numberOfChannels: 1,
+      timestamp: 0,
+      data: pcmData
+    });
+    audioEncoder.encode(audioData);
+    audioData.close();
+
+    const fps = 60;
+    const totalFrames = Math.ceil((duration + 0.1) * fps);
+    const frameMicros = 1_000_000 / fps;
+
+    for (let i = 0; i < totalFrames; i++) {
+      const tSec = i / fps;
+
+      let shape = 0;
+      for (const e of events) {
+        if (e.start_time <= tSec) shape = e.mouth_shape;
+        else break;
+      }
+
+      drawFrame(ctx, mode, shape);
+
+      const timestamp = Math.round(i * frameMicros);
+      const frame = new VideoFrame(canvas, { timestamp });
+      videoEncoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+      frame.close();
+
+      if (i % 30 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    await videoEncoder.flush();
+    await audioEncoder.flush();
+    muxer.finalize();
+
+    const { buffer } = muxer.target;
+    const mp4Blob = new Blob([buffer], { type: "video/mp4" });
+    const url = URL.createObjectURL(mp4Blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = mode === "face" ? "talking_face.mp4" : "mouth_greenscreen.mp4";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    audioCtx.close();
+    setStatus("Export complete!", "success");
+  } catch (err) {
+    console.error(err);
+    return exportVideoMediaRecorder(mode);
+  } finally {
+    generateBtn.disabled = playBtn.disabled = downloadFaceBtn.disabled = downloadMouthBtn.disabled = false;
+  }
+}
+
+async function exportVideoMediaRecorder(mode) {
+  generateBtn.disabled = playBtn.disabled = downloadFaceBtn.disabled = downloadMouthBtn.disabled = true;
+  setStatus(`Exporting ${mode === "face" ? "face" : "greenscreen mouth"}...`, "loading");
 
   try {
     const canvas = document.createElement("canvas");
@@ -319,11 +431,9 @@ async function exportVideo(mode) {
       ...destNode.stream.getAudioTracks()
     ]);
 
-    const mimeType = getMimeType();
-    const options = mimeType ? { mimeType } : {};
     let mediaRecorder;
     try {
-      mediaRecorder = new MediaRecorder(stream, options);
+      mediaRecorder = new MediaRecorder(stream, { mimeType: "video/mp4" });
     } catch (e) {
       mediaRecorder = new MediaRecorder(stream);
     }
@@ -338,7 +448,7 @@ async function exportVideo(mode) {
     await new Promise((resolve) => {
       let animId;
       mediaRecorder.onstop = () => {
-        const recordedMime = mediaRecorder.mimeType || mimeType || "video/mp4";
+        const recordedMime = mediaRecorder.mimeType || "video/mp4";
         const blob = new Blob(chunks, { type: recordedMime });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
